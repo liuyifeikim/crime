@@ -1,0 +1,223 @@
+---
+title: "crime"
+output: html_document
+---
+
+* 数据来源：https://www.kaggle.com/currie32/crimes-in-chicago
+
+* 任务：
+数据导入
+数据粗清理
+变量探索性分析
+特征工程
+（抽样）：根据包含所有信息的最小样本数
+
+```{r, message=FALSE}
+# 载入库
+library(tidyverse)
+library(skimr)
+library(tidymodels)
+library(pryr)
+library(lubridate)
+library(foreach)
+library(doParallel)
+library(doRNG)
+```
+
+```{r}
+# 自定义函数
+source(file = "function.r")
+```
+
+
+* 数据读入：先读入训练数据，后面考虑抽样处理。
+
+```{r, message=FALSE}
+# 读入训练数据
+train <- read_csv("train.csv", col_names = TRUE)
+train %>% head()
+object_size(train)
+```
+
+* 对数据进行粗清理：
+删除明显无用的列
+删除缺失很多的列
+保留完整样本
+对类型进行初步转化，不用太精准，后面还会再变化
+
+```{r}
+# 删除没有用的列
+train %>% 
+  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, Latitude, Longitude, Location)) %>% 
+  mutate_if(is.double, as.integer) %>% 
+  mutate_if(is.logical, as.integer) -> train
+train %>% head()
+object_size(train)
+```
+
+```{r}
+# 进一步看详细信息
+skim(train)
+```
+
+
+```{r}
+# 保留完整数据
+train %>% 
+  filter(complete.cases(.)) %>% 
+  filter(`Location Description` != "") -> train
+skim(train)
+```
+
+* 探索性分析：形成特征工程的思路
+看各个类别变量分布，包括部分数值变量
+看各个数值变量分布
+判断每个变量适合的类型，例如有些数值变量可能变为类别变量更合适
+
+```{r}
+# 类别变量
+cat_per_fun(train, Block)
+cat_per_fun(train, `Primary Type`)
+cat_per_fun(train, Description)
+cat_per_fun(train, `Location Description`)
+cat_per_fun(train, Arrest)
+cat_per_fun(train, Domestic)
+cat_per_fun(train, Beat)
+cat_per_fun(train, District)
+cat_per_fun(train, Ward)
+cat_per_fun(train, `Community Area`)
+```
+
+* 特征工程：根据对训练集的探索性分析做特征工程，并套用到测试集上面，有些特征可以在训练集和测试集上直接做，有些需要结合重抽样过程。有些放在recipe内，有些放在recipe外
+Date：提取年、月、日、星期几、小时，时间的格式转化可以放在recipe之前
+Block：提取街区类型，并重新归类，提取类型可以在recipe之前
+Primary Type：重新归类，放到recipe中
+Description：重新归类，放到recipe中
+Location Description：重新归类，放到recipe中
+其他：暂不修改
+
+```{r}
+# 时间特征
+train %>% 
+  separate(col = Date, into = c("date", "time", "ap"), sep = " ") %>% 
+  mutate(date = mdy(date), time = hms(time)) %>% 
+  mutate(month = month(date),
+         wday = wday(date),
+         hour = if_else(ap == "PM", hour(time) + 12, hour(time))) %>% 
+  select(-c(date, time, ap)) -> train_feature
+
+# 查看结果
+train_feature %>% head()
+```
+
+```{r}
+# Block
+
+# 提取最后一个词：放到recipe外
+train_feature %>% 
+  mutate(block_type = str_split(Block, " ")) %>% 
+  mutate(block_type = sapply(block_type, function(x) last(unlist(x)))) %>% 
+  select(-Block) -> train_feature
+
+# 查看结果，将少类别归为其他类
+train_feature %>% head()
+cat_per_fun(train_feature, block_type) %>% 
+  filter(percent > 0.001) %>% 
+  select(block_type) %>% 
+  pull() -> main_block_type
+main_block_type
+
+# 类型调整
+train_feature %>% 
+  mutate(block_type = if_else(block_type %in% main_block_type, block_type, "OTHER")) -> train_feature
+
+# 查看结果
+train_feature %>% 
+  count(block_type, sort = TRUE) %>% 
+  mutate(percent = n / sum(n))
+```
+
+```{r}
+# Primary Type
+
+# 整合少数类
+cat_per_fun(train_feature, `Primary Type`) %>% 
+  filter(percent > 0.001) %>% 
+  select(`Primary Type`) %>% 
+  pull() -> main_primary_type
+main_primary_type
+
+# 类型调整
+train_feature %>% 
+  mutate(primary_type = if_else(`Primary Type` %in% main_primary_type, `Primary Type`, "OTHER")) %>% 
+  select(-`Primary Type`) -> train_feature
+
+# 查看结果
+train_feature %>% 
+  count(primary_type, sort = TRUE) %>% 
+  mutate(percent = n / sum(n))
+```
+
+```{r}
+# Description
+cat_per_fun(train_feature, Description) %>% 
+  filter(percent > 0.002) %>% 
+  select(Description) %>% 
+  pull() -> main_description
+main_description
+
+# 类型调整
+train_feature %>% 
+  mutate(description = if_else(Description %in% main_description, Description, "OTHER")) %>% 
+  select(-Description) -> train_feature
+
+# 查看结果
+train_feature %>% 
+  count(description, sort = TRUE) %>% 
+  mutate(percent = n / sum(n))
+```
+
+```{r}
+# Location Description
+cat_per_fun(train_feature, `Location Description`) %>% 
+  filter(percent > 0.002) %>% 
+  select(`Location Description`) %>% 
+  pull() -> main_location_description
+main_location_description
+
+# 类型调整
+train_feature %>% 
+  mutate(location_description = if_else(`Location Description` %in% main_location_description, `Location Description`, "OTHER")) %>% 
+  select(-`Location Description`) -> train_feature
+
+# 查看结果
+train_feature %>% 
+  count(location_description, sort = TRUE) %>% 
+  mutate(percent = n / sum(n))
+```
+
+抽样评估：样本中各个类别的取值基本能够保留全样本的信息，没有类别丢失。
+
+```{r}
+train_feature %>% head()
+```
+
+```{r}
+# 测试抽样结果中每个变量的类别情况
+registerDoParallel(cores = 12)
+registerDoRNG(100)
+sample_test <- foreach(i = seq(from = 1, to = 0.02, by = -0.02),
+                       .combine = "rbind",
+                       .packages = "dplyr") %dopar% cat_sample_fun(train_feature, i)
+stopImplicitCluster()
+sample_test
+```
+
+
+```{r}
+# set.seed(100)
+# train_feature %>% 
+#   sample_n(size = 1000000) -> train_sample
+# cat_sample_fun(train_sample, 1)
+```
+

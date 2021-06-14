@@ -1,0 +1,112 @@
+---
+title: "crime"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(usemodels)
+library(lubridate)
+tidymodels_prefer()
+```
+
+
+```{r}
+# 读入数据
+train <- read_csv("train.csv", col_names = TRUE)
+```
+
+* recipe之前的预处理：
+生成一些recipe的step没有办法生成或难以生成的变量
+删除缺失值后再抽样
+
+```{r}
+# recipe前的预处理
+set.seed(100)
+train %>% 
+  filter(complete.cases(.)) %>% 
+  filter(`Location Description` != "") %>% 
+  separate(col = Date, into = c("date", "time", "ap"), sep = " ") %>% 
+  mutate(date = mdy(date), time = hms(time)) %>% 
+  mutate(Month = month(date), Wday = wday(date), Hour = if_else(ap == "PM", hour(time) + 12, hour(time))) %>% 
+  mutate(Block_type = str_split(Block, " ")) %>% 
+  mutate(Block_type = sapply(Block_type, function(x) last(unlist(x)))) %>% 
+  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, Latitude, Longitude, Location, 
+            Block, date, time, ap)) %>% 
+  mutate_if(is.double, as.integer) %>% 
+  mutate_if(is.logical, as.factor) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  sample_n(size = 500000) -> train_sample
+
+# 查看结果
+train_sample
+dim(train_sample)
+```
+
+* tidymodels预处理部分：尽可能将过程放入这里
+
+```{r}
+# 使用recipe建立处理过程
+crime_rec <- recipe(Arrest ~ ., data = train_sample) %>% 
+  update_role(ID, new_role = "ID") %>% 
+  step_rename(Primary_type = `Primary Type`, Location_Description = `Location Description`) %>% 
+  step_other(Block_type, Primary_type, threshold = 0.001, other = "OTHER_TYPE") %>% 
+  step_other(Description, Location_Description, threshold = 0.002, other = "OTHER_TYPE") %>% 
+  step_rm(Year) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors())
+crime_rec
+```
+
+```{r}
+# 预处理过程训练
+crime_prep <- prep(crime_rec) # 注意变量命名规范
+crime_prep
+tidy(crime_prep)
+```
+
+```{r}
+# 将转换用在训练数据或者新数据上
+crime_bake <- bake(crime_prep, new_data = NULL)
+crime_bake
+object_size(crime_bake)
+```
+
+
+```{r}
+# 查看转换后的结果
+# crime_juice <- juice(crime_prep)
+# crime_juice
+# object_size(crime_juice)
+# identical(crime_bake, crime_juice) # 和bake的效果一样
+```
+
+
+```{r}
+# 模型设定
+rand_forest(trees = 100) %>% # 设定通用参数，共三个
+  set_engine("ranger", seed = 100, num.threads = 12, verbose = TRUE) %>%  # 设定每个库对应的参数
+  set_mode("classification") -> rf_model
+rf_model
+
+# 模型训练
+rf_model_fit <- rf_model %>% fit(Arrest ~ ., data = train_sample) # 没有做recipe的预处理转换
+rf_model_fit
+```
+
+```{r}
+# 查看基本信息
+rf_model_fit %>% pluck("fit")
+```
+
+```{r}
+# 建立工作流
+rf_wf <- workflow() %>% add_recipe(crime_rec) %>% add_model(rf_model)
+rf_wf
+
+# 用工作流拟合训练数据
+rf_wf_fit <- fit(rf_wf, data = train_sample) # fit = prep + bake
+rf_wf_fit
+```
+

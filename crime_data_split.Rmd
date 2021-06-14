@@ -1,0 +1,84 @@
+---
+title: "crime"
+output: html_document
+---
+
+* 数据来源：https://www.kaggle.com/currie32/crimes-in-chicago
+
+将数据分为训练、测试、生产数据。假定一开始就分了三个部分。
+
+```{r, message=FALSE}
+# 载入库
+library(disk.frame)
+library(pryr)
+library(lubridate)
+library(skimr)
+library(tidyverse)
+```
+
+
+```{r}
+# 设置线程数
+setup_disk.frame(workers = 12)
+```
+
+* 导入数据，用disk.frame的方式导入。
+
+```{r, message=FALSE}
+# 读入多个数据
+path <- "D:/K/DATA EXERCISE/Kaggle/Crimes in Chicago"
+crime_files <- list.files(path, pattern = "Chicago_Crimes*")
+path_crime_files <- file.path(path, crime_files)
+crime_disk <- csv_to_disk.frame(
+  infile = path_crime_files,
+  outdir = "crime_fst",
+  compress = 100,
+  overwrite = TRUE,
+  backend = "data.table"
+)
+```
+
+
+```{r}
+# 查看基本信息
+crime_disk
+class(crime_disk)
+object_size(crime_disk)
+crime_disk %>% head()
+```
+
+* 数据集划分：训练数据，测试数据，生产数据。假定一开始就是按三者分开的。在实际生产时，可以根据需要调整训练数据和测试数据的数量。
+
+```{r}
+# 各年份比例
+crime_disk %>% 
+  group_by(Year) %>% 
+  summarise(n = n()) %>% 
+  collect() %>% # 要先collect才能做右面的部分
+  mutate(percent = n / sum(n) * 100) -> year_prop
+year_prop
+```
+
+
+```{r}
+# 数据集划分
+crime_disk %>% filter(between(Year, 2001, 2010)) %>% collect() -> crime_train_tbl  # 训练
+crime_disk %>% filter(between(Year, 2011, 2014)) %>% collect() -> crime_test_tbl   # 测试
+crime_disk %>% filter(between(Year, 2015, 2017)) %>% collect() -> crime_prod_tbl   # 生产
+dim(crime_train_tbl)
+dim(crime_test_tbl)
+dim(crime_prod_tbl)
+```
+
+
+```{r}
+# 读出数据
+write_csv(crime_train_tbl, "train.csv")
+write_csv(crime_test_tbl, "test.csv")
+write_csv(crime_prod_tbl, "prod.csv")
+```
+
+
+```{r}
+rm(list = ls())
+```
