@@ -8,40 +8,53 @@ library(tidyverse)
 library(tidymodels)
 library(usemodels)
 library(lubridate)
+library(pryr)
+library(doParallel)
+library(tictoc)
 tidymodels_prefer()
 ```
 
 
 ```{r}
+# 读入自定义函数
+source(file = "function.r")
+```
+
+
+```{r, message=FALSE}
 # 读入数据
 train <- read_csv("train.csv", col_names = TRUE)
+train %>% head()
 ```
 
 * recipe之前的预处理：
-生成一些recipe的step没有办法生成或难以生成的变量
+生成一些recipe的step没有办法生成或难以生成的变量，其他尽量放在recipe中处理
 删除缺失值后再抽样
+类型转换可以放到recipe当中
 
 ```{r}
 # recipe前的预处理
 set.seed(100)
 train %>% 
   filter(complete.cases(.)) %>% 
-  filter(`Location Description` != "") %>% 
-  separate(col = Date, into = c("date", "time", "ap"), sep = " ") %>% 
-  mutate(date = mdy(date), time = hms(time)) %>% 
-  mutate(Month = month(date), Wday = wday(date), Hour = if_else(ap == "PM", hour(time) + 12, hour(time))) %>% 
+  sample_n(size = 500000) %>% 
+  rename(Primary_type = `Primary Type`, 
+         Location_Description = `Location Description`, 
+         Community_Area = `Community Area`) %>%
+  separate(col = Date, into = c("Date", "Time", "AP"), sep = " ") %>% # 复杂处理放到recipe外处理
+  mutate(Date = mdy(Date), Time = hms(Time)) %>% 
+  mutate(Hour = if_else(AP == "PM", hour(Time) + 12, hour(Time))) %>% # recipe没有关于time的处理工具
   mutate(Block_type = str_split(Block, " ")) %>% 
   mutate(Block_type = sapply(Block_type, function(x) last(unlist(x)))) %>% 
-  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, Latitude, Longitude, Location, 
-            Block, date, time, ap)) %>% 
-  mutate_if(is.double, as.integer) %>% 
-  mutate_if(is.logical, as.factor) %>% 
-  mutate_if(is.character, as.factor) %>% 
-  sample_n(size = 500000) -> train_sample
+  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, Location, Block, Time, AP, Year)) %>% 
+  mutate(across(where(is.double) & !c("Latitude", "Longitude", "Date"), as.integer),
+         across(where(is.character) | where(is.logical), as.factor)) %>% 
+  arrange(Date) -> train_sample
 
 # 查看结果
-train_sample
+train_sample %>% head()
 dim(train_sample)
+object_size(train_sample)
 ```
 
 * tidymodels预处理部分：尽可能将过程放入这里
@@ -50,12 +63,15 @@ dim(train_sample)
 # 使用recipe建立处理过程
 crime_rec <- recipe(Arrest ~ ., data = train_sample) %>% 
   update_role(ID, new_role = "ID") %>% 
-  step_rename(Primary_type = `Primary Type`, Location_Description = `Location Description`) %>% 
-  step_other(Block_type, Primary_type, threshold = 0.001, other = "OTHER_TYPE") %>% 
-  step_other(Description, Location_Description, threshold = 0.002, other = "OTHER_TYPE") %>% 
-  step_rm(Year) %>% 
-  step_novel(all_nominal_predictors()) %>% 
-  step_dummy(all_nominal_predictors())
+  update_role(Date, new_role = "Date") %>% 
+  step_other(Block_type, Primary_type, threshold = 0.001, other = "OTHER_TYPE") %>%             # 前期探索分析确定
+  step_other(Description, Location_Description, threshold = 0.002, other = "OTHER_TYPE") %>%    # 前期探索分析确定
+  step_date(Date, features = c("dow", "month"), label = FALSE) %>%                              # 只保留数字
+  step_novel(all_nominal_predictors()) %>% # 生成一个新类型
+  step_dummy(all_nominal_predictors()) %>% # 生成double类型数据
+  step_mutate_at(where(is.double) & !c("Latitude", "Longitude", "Date"), fn = as.integer)
+
+# 查看结果
 crime_rec
 ```
 
@@ -64,15 +80,15 @@ crime_rec
 crime_prep <- prep(crime_rec) # 注意变量命名规范
 crime_prep
 tidy(crime_prep)
+summary(crime_prep)
 ```
 
 ```{r}
 # 将转换用在训练数据或者新数据上
-crime_bake <- bake(crime_prep, new_data = NULL)
-crime_bake
+crime_bake <- bake(crime_prep, new_data = NULL) # 用在训练集上
+crime_bake %>% head()
 object_size(crime_bake)
 ```
-
 
 ```{r}
 # 查看转换后的结果
@@ -91,22 +107,71 @@ rand_forest(trees = 100) %>% # 设定通用参数，共三个
 rf_model
 
 # 模型训练
-rf_model_fit <- rf_model %>% fit(Arrest ~ ., data = train_sample) # 没有做recipe的预处理转换
-rf_model_fit
-```
-
-```{r}
-# 查看基本信息
-rf_model_fit %>% pluck("fit")
+# rf_model_fit <- rf_model %>% fit(Arrest ~ ., data = train_sample) # 没有做recipe的预处理转换
+# rf_model_fit
 ```
 
 ```{r}
 # 建立工作流
-rf_wf <- workflow() %>% add_recipe(crime_rec) %>% add_model(rf_model)
+rf_wf <- workflow() %>% 
+  add_recipe(crime_rec) %>%
+  add_model(rf_model)
 rf_wf
 
 # 用工作流拟合训练数据
-rf_wf_fit <- fit(rf_wf, data = train_sample) # fit = prep + bake
+rf_wf_fit <- rf_wf %>% fit(data = train_sample) # fit = prep + bake
 rf_wf_fit
 ```
+
+* 实现K折交叉检验：先不管年份
+
+```{r}
+set.seed(100)
+cv_5 <- vfold_cv(train_sample, v = 5)
+cv_5
+rf_wf_cv_5 <- rf_wf %>% fit_resamples(cv_5)
+```
+
+```{r}
+# 查看结果:要确定如何设定正样本
+rf_wf_cv_5 %>% collect_metrics()
+```
+
+* 按时间进行滚动交叉检验:
+https://github.com/tidymodels/rsample/issues/42
+https://stackoverflow.com/questions/51925991/combining-rolling-origin-forecast-resampling-and-group-v-fold-cross-validation-i
+https://stackoverflow.com/questions/64820223/combine-nesting-and-rolling-origin-from-tidymodels-in-r
+https://rsample.tidymodels.org/reference/slide-resampling.html
+
+```{r}
+# 划分数据集
+train_sample %>% 
+  arrange(Date) %>% 
+  sliding_period(index = Date, period = "year", lookback = 3, assess_stop = 2) -> cv_rolling
+cv_rolling$splits
+```
+
+```{r}
+# 重抽样检验
+keep_pred <- control_resamples(save_pred = TRUE, verbose = TRUE, allow_par = TRUE, parallel_over = "everything")
+registerDoParallel(cores = 12)
+set.seed(100)
+tic()
+rf_wf_cv_rolling <- rf_wf %>% fit_resamples(resamples = cv_rolling, control = keep_pred)
+toc()
+stopImplicitCluster()
+```
+
+```{r}
+set.seed(100)
+tic()
+rf_wf_cv_rolling <- rf_wf %>% fit_resamples(resamples = cv_rolling, control = keep_pred)
+toc()
+```
+
+
+```{r}
+rf_wf_cv_rolling %>% collect_metrics()
+```
+
 

@@ -5,18 +5,19 @@ output: html_document
 
 * 数据来源：https://www.kaggle.com/currie32/crimes-in-chicago
 
+* 由于不是用全部数据训练模型，后面要抽样，因此需要现在全样本上处理一次，尤其是观察类别变量的情况，进一步确定抽样方案
+
 * 任务：
 数据导入
 数据粗清理
 变量探索性分析
 特征工程
-（抽样）：根据包含所有信息的最小样本数
+抽样：根据包含所有信息的最小样本数
 
 ```{r, message=FALSE}
 # 载入库
 library(tidyverse)
 library(skimr)
-library(tidymodels)
 library(pryr)
 library(lubridate)
 library(foreach)
@@ -30,7 +31,7 @@ source(file = "function.r")
 ```
 
 
-* 数据读入：先读入训练数据，后面考虑抽样处理。
+* 数据读入：先读入训练数据，查看整体情况。
 
 ```{r, message=FALSE}
 # 读入训练数据
@@ -39,33 +40,29 @@ train %>% head()
 object_size(train)
 ```
 
+```{r}
+# 观察整体情况
+skim(train)
+```
+
 * 对数据进行粗清理：
 删除明显无用的列
-删除缺失很多的列
+删除缺失很多的列：暂时没有缺失很多的列，缺失较多的列也是需要的列
 保留完整样本
 对类型进行初步转化，不用太精准，后面还会再变化
 
+
 ```{r}
-# 删除没有用的列
+# 删除没有用的列，缺失值不多，保留完整数据
 train %>% 
-  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, Latitude, Longitude, Location)) %>% 
-  mutate_if(is.double, as.integer) %>% 
-  mutate_if(is.logical, as.integer) -> train
+  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, Location)) %>% 
+  filter(complete.cases(.)) -> train
 train %>% head()
 object_size(train)
 ```
 
 ```{r}
 # 进一步看详细信息
-skim(train)
-```
-
-
-```{r}
-# 保留完整数据
-train %>% 
-  filter(complete.cases(.)) %>% 
-  filter(`Location Description` != "") -> train
 skim(train)
 ```
 
@@ -219,5 +216,9 @@ sample_test
 # train_feature %>% 
 #   sample_n(size = 1000000) -> train_sample
 # cat_sample_fun(train_sample, 1)
+```
+
+```{r}
+rm(list = ls())
 ```
 
