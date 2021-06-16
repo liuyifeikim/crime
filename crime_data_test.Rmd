@@ -1,0 +1,71 @@
+---
+title: "crime"
+output: html_document
+---
+
+```{r}
+library(tidymodels)
+library(tictoc)
+library(tidyverse)
+library(skimr)
+```
+
+```{r}
+# 读入数据
+test <- read_csv("test.csv", col_names = TRUE)
+test %>% head()
+```
+
+```{r}
+# recipe前的预处理
+set.seed(100)
+test %>% 
+  filter(complete.cases(.)) %>% 
+  sample_n(size = 300000) %>% 
+  rename(Primary_type = `Primary Type`, 
+         Location_Description = `Location Description`, 
+         Community_Area = `Community Area`) %>%
+  separate(col = Date, into = c("Date", "Time", "AP"), sep = " ") %>% # 复杂处理放到recipe外处理
+  mutate(Date = mdy(Date), Time = hms(Time)) %>% 
+  mutate(Hour = if_else(AP == "PM", hour(Time) + 12, hour(Time))) %>% # recipe没有关于time的处理工具
+  mutate(Block_type = str_split(Block, " ")) %>% 
+  mutate(Block_type = sapply(Block_type, function(x) last(unlist(x)))) %>% 
+  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, 
+            Location, Block, Time, AP, Year)) %>% 
+  mutate(across(where(is.double) & !c("Latitude", "Longitude", "Date"), as.integer),
+         across(where(is.character) | where(is.logical), as.factor)) %>% 
+  arrange(Date) -> test_sample
+
+# 查看结果
+test_sample %>% head()
+dim(test_sample)
+object_size(test_sample)
+rm(test)
+gc()
+```
+
+```{r}
+# 读入工作流
+rf_wf_final_fit <- readRDS("rf_wf_final_fit.rds")
+rf_wf_final_fit
+```
+
+```{r}
+# 对test进行转化
+test_bake <- bake(train_prep, new_data = test_sample)
+test_bake
+```
+
+
+```{r}
+# 预测测试集
+test_sample_predict <- predict(rf_wf_final_fit, test_sample)
+test_sample_predict
+```
+
+```{r}
+# 预测测试集
+test_sample_predict <- rf_wf_final_fit %>% predict(test_sample)
+test_sample_predict
+```
+
