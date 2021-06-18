@@ -3,21 +3,33 @@ title: "crime"
 output: html_document
 ---
 
-```{r}
+测试集报错问题：
+https://github.com/tidymodels/recipes/issues/494
+https://github.com/tidymodels/recipes/issues/627
+
+
+```{r, message=FALSE}
 library(tidymodels)
 library(tictoc)
 library(tidyverse)
 library(skimr)
 ```
 
+
 ```{r}
+source("function.r")
+```
+
+
+```{r, message=FALSE}
 # 读入数据
 test <- read_csv("test.csv", col_names = TRUE)
 test %>% head()
 ```
 
+
 ```{r}
-# recipe前的预处理
+# 使用recipe建立处理过程
 set.seed(100)
 test %>% 
   filter(complete.cases(.)) %>% 
@@ -34,38 +46,52 @@ test %>%
             Location, Block, Time, AP, Year)) %>% 
   mutate(across(where(is.double) & !c("Latitude", "Longitude", "Date"), as.integer),
          across(where(is.character) | where(is.logical), as.factor)) %>% 
+  mutate(Arrest = fct_relevel(Arrest, "TRUE")) %>% 
   arrange(Date) -> test_sample
 
 # 查看结果
 test_sample %>% head()
 dim(test_sample)
 object_size(test_sample)
+
+# 删除对象
 rm(test)
 gc()
 ```
 
-```{r}
-# 读入工作流
-rf_wf_final_fit <- readRDS("rf_wf_final_fit.rds")
-rf_wf_final_fit
-```
 
 ```{r}
-# 对test进行转化
-test_bake <- bake(train_prep, new_data = test_sample)
-test_bake
+# 预测结果，将结果放在一个数据框中
+# rf_wf_final_fit <- readRDS("rf_wf_final_fit.rds")
+rf_wf_pred_prob <- rf_wf_final_fit %>% predict(test_sample, type = "prob")
+rf_wf_pred_class <- rf_wf_final_fit %>% predict(test_sample)
+rf_wf_pred_prob
+rf_wf_pred_class
+rf_wf_pred_truth <- bind_cols(
+  rf_wf_pred_prob %>% select(.pred_TRUE), 
+  rf_wf_pred_class %>% select(.pred_class),
+  test_sample %>% select(Arrest)) %>% 
+  rename(pred_prob = .pred_TRUE, pred_class = .pred_class, truth = Arrest)
+rf_wf_pred_truth
 ```
 
 
 ```{r}
-# 预测测试集
-test_sample_predict <- predict(rf_wf_final_fit, test_sample)
-test_sample_predict
+# 混淆矩阵
+rf_wf_pred_truth %>% count(pred_class)
+rf_wf_pred_truth %>% count(truth)
+conf_mat(data = rf_wf_pred_truth, truth = truth, estimate = pred_class)
+accuracy(data = rf_wf_pred_truth, truth = truth, estimate = pred_class)
 ```
 
+
 ```{r}
-# 预测测试集
-test_sample_predict <- rf_wf_final_fit %>% predict(test_sample)
-test_sample_predict
+# roc
+levels(rf_wf_pred_truth$truth) # 注意正样本是第几个
+roc_auc(data = rf_wf_pred_truth, truth = truth, estimate = pred_prob, event_level = "first")
+two_class_curve <- roc_curve(rf_wf_pred_truth, truth = truth, estimate = pred_prob, event_level = "first")
+two_class_curve
+autoplot(two_class_curve)
 ```
+
 

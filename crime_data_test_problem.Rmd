@@ -1,0 +1,171 @@
+---
+title: "crime"
+output: html_document
+---
+
+测试集报错问题：
+https://github.com/tidymodels/recipes/issues/494
+https://github.com/tidymodels/recipes/issues/627
+
+
+```{r, message=FALSE}
+library(tidymodels)
+library(tictoc)
+library(tidyverse)
+library(skimr)
+```
+
+
+```{r}
+source("function.r")
+```
+
+
+```{r, message=FALSE}
+# 读入数据
+train <- read_csv("train.csv", col_names = TRUE)
+test <- read_csv("test.csv", col_names = TRUE)
+```
+
+
+```{r}
+set.seed(100)
+train %>% 
+  filter(complete.cases(.)) %>% 
+  sample_n(size = 500000) %>% 
+  rename(Primary_type = `Primary Type`) %>%
+  select(ID, Primary_type, Arrest) %>% 
+  mutate(across(where(is.character) | where(is.logical), as.factor)) -> train_sample
+train_sample %>% head()
+```
+
+```{r}
+set.seed(100)
+test %>% 
+  filter(complete.cases(.)) %>% 
+  sample_n(size = 300000) %>% 
+  rename(Primary_type = `Primary Type`) %>% 
+  select(ID, Primary_type, Arrest) %>% 
+  mutate(across(where(is.character) | where(is.logical), as.factor)) -> test_sample
+test_sample %>% head()
+```
+
+```{r}
+str(train_sample)
+str(test_sample)
+```
+
+
+```{r}
+# 使用recipe建立处理过程
+rec <- recipe(Arrest ~ ., data = train_sample) %>% 
+  update_role(ID, new_role = "ID") %>% 
+  step_novel(Primary_type)
+
+rf_model <- rand_forest(trees = 10) %>%
+  set_engine("ranger", seed = 100, num.threads = 12, verbose = TRUE) %>%
+  set_mode("classification")
+
+wf <- workflow() %>% 
+  add_recipe(rec, blueprint = hardhat::default_recipe_blueprint(allow_novel_levels = TRUE)) %>% # 可以解决后面的报错问题
+  add_model(rf_model)
+
+wf
+```
+
+```{r}
+# fit the train data
+wf_fit <- wf %>% fit(train_sample)
+wf_fit
+```
+
+```{r}
+wf_pred <- wf_fit %>% predict(test_sample)
+wf_pred
+```
+
+```{r}
+train_prep <- prep(rec, training = train_sample)
+train_bake <- bake(train_prep, new_data = NULL)
+test_bake <- bake(train_prep, new_data = test_sample)
+skim(train_bake)
+skim(test_bake)
+```
+
+```{r}
+rf_model %>% fit(Arrest ~ Primary_type, train_bake) -> rf_model_fit
+rf_model_fit
+```
+
+```{r}
+rf_model_predict <- rf_model_fit %>% predict(test_bake)
+rf_model_predict
+rf_model_predict %>% count(.pred_class)
+```
+
+```{r}
+levels(train_sample$Primary_type)
+```
+
+
+```{r}
+levels(test_sample$Primary_type)
+```
+
+
+```{r}
+setdiff(levels(test_sample$Primary_type), levels(train_sample$Primary_type))
+setdiff(levels(train_sample$Primary_type), levels(test_sample$Primary_type))
+```
+
+```{r}
+levels(train_bake$Primary_type)
+```
+
+
+```{r}
+table(test_bake$Primary_type)
+```
+
+
+
+```{r}
+identical(levels(train_bake$Primary_type), levels(test_bake$Primary_type))
+# setdiff(levels(test_bake$Primary_type), levels(train_bake$Primary_type))
+# setdiff(levels(train_bake$Primary_type), levels(test_bake$Primary_type))
+```
+
+
+```{r}
+lr_model <- logistic_reg() %>% set_engine("glm")
+wf %>% update_model(lr_model) -> wf_lr
+wf_lr
+```
+
+```{r}
+wf_lr_fit <- wf_lr %>% fit(train_sample)
+wf_lr_fit
+```
+
+```{r}
+wf_lr_fit %>% predict(test_sample)
+```
+
+
+
+```{r}
+# 读入工作流
+# rf_wf_final_fit <- readRDS("rf_wf_final_fit.rds")
+# rf_wf_final_fit
+
+# 预测测试集
+# test_temp_predict <- rf_wf_final_fit %>% predict(test_temp)
+# test_temp_predict
+```
+
+
+```{r}
+data(okc)
+okc
+```
+
