@@ -266,6 +266,12 @@ finalize_param %>% grid_regular(min_n(), mtry(), levels = 3)
 
 
 ```{r}
+mtry()
+min_n()
+```
+
+
+```{r}
 # 参数调整：非常耗时
 cl <- makeCluster(12)
 registerDoParallel(cl)
@@ -296,6 +302,8 @@ rf_wf_final
 rf_wf_final_fit <- rf_wf_final %>% fit(train_sample)
 rf_wf_final_fit %>% pull_workflow_fit()
 rf_wf_final_fit %>% pull_workflow_prepped_recipe()
+rf_wf_final_fit %>% pull_workflow_spec()
+rf_wf_final_fit %>% pull_workflow_mold()
 ```
 
 ```{r}

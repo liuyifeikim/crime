@@ -1,0 +1,33 @@
+---
+title: "crime"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(lubridate)
+```
+
+```{r}
+source("function.r")
+```
+
+
+```{r}
+prod <- prod_prep_before_recipe_fun("prod.csv")
+prod
+```
+
+```{r}
+# 读入工作流
+rf_wf_final_fit <- read_rds("rf_wf_final_fit.rds")
+rf_wf_final_fit
+```
+
+
+```{r}
+prod_pred <- rf_wf_final_fit %>% predict(prod) %>% bind_cols(prod)
+prod_pred
+```
+

@@ -25,13 +25,14 @@ library(doParallel)
 library(doRNG)
 ```
 
+
 ```{r}
 # 自定义函数
 source(file = "function.r")
 ```
 
 
-* 数据读入：先读入训练数据，查看整体情况。
+* 数据读入：先读入训练数据，再查看整体情况。
 
 ```{r, message=FALSE}
 # 读入训练数据
@@ -39,6 +40,17 @@ train <- read_csv("train.csv", col_names = TRUE)
 train %>% head()
 object_size(train)
 ```
+
+* 观察整体情况：
+有一些列可能是ID，如Case Number, V1, ID等，可以删除
+Date可以处理为时间格式, Year可能可以删除, Update_on可以删除
+一些n_unique太多的列需要考虑合并或删除
+character和logical都转为factor更好
+Beat, District, Ward, Community Area表面是数值，实际上应该理解为类别
+X Coordinate, y Coordinate和Latitude及Longitude及Location基本对应，保留其一
+保留完整数据，不考虑缺失数据
+IUCR可能和Description一一对应
+
 
 ```{r}
 # 观察整体情况
@@ -55,21 +67,116 @@ skim(train)
 ```{r}
 # 删除没有用的列，缺失值不多，保留完整数据
 train %>% 
-  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, Location)) %>% 
-  filter(complete.cases(.)) -> train
-train %>% head()
-object_size(train)
+  select(-c(V1, `Case Number`, `X Coordinate`, `Y Coordinate`, `Updated On`, Location, Year)) %>% 
+  filter(complete.cases(.)) -> train_simple_clear
+train_simple_clear %>% head()
+object_size(train_simple_clear)
 ```
 
 ```{r}
 # 进一步看详细信息
-skim(train)
+skim(train_simple_clear)
 ```
 
 * 探索性分析：形成特征工程的思路
 看各个类别变量分布，包括部分数值变量
 看各个数值变量分布
 判断每个变量适合的类型，例如有些数值变量可能变为类别变量更合适
+
+```{r, fig.height=7, fig.width=15}
+# Date:划分为月份、星期几和小时
+
+# date
+train_simple_clear %>% 
+  separate(col = Date, into = c("date", "time", "ap"), sep = " ") %>% 
+  mutate(date = mdy(date)) %>% 
+  group_by(date, Arrest) %>%
+  summarise(n = n()) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(Arrest == TRUE) %>% 
+  ggplot(aes(date, proportion)) +
+  geom_point() +
+  geom_line() +
+  scale_x_date(date_breaks = "6 months")
+    
+
+# month
+train_simple_clear %>% 
+  separate(col = Date, into = c("date", "time", "ap"), sep = " ") %>% 
+  mutate(date = mdy(date)) %>% 
+  mutate(Month = month(date, label = TRUE)) %>% 
+  group_by(Month, Arrest) %>%
+  summarise(n = n()) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(Arrest == TRUE) %>% 
+  ggplot(aes(Month, proportion)) +
+  geom_col()
+
+# wday
+train_simple_clear %>% 
+  separate(col = Date, into = c("date", "time", "ap"), sep = " ") %>% 
+  mutate(date = mdy(date)) %>% 
+  mutate(Wday = wday(date, label = TRUE)) %>% 
+  group_by(Wday, Arrest) %>% 
+  summarise(n = n()) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(Arrest == TRUE) %>% 
+  ggplot(aes(Wday, proportion)) +
+  geom_col()
+
+# hour
+train_simple_clear %>% 
+  separate(col = Date, into = c("date", "time", "ap"), sep = " ") %>% 
+  mutate(time = hms(time)) %>% 
+  mutate(Hour = if_else(ap == "PM", hour(time) + 12, hour(time))) %>% 
+  group_by(Hour, Arrest) %>% 
+  summarise(n = n()) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(Arrest == TRUE) %>% 
+  ggplot(aes(Hour, proportion)) +
+  geom_col()
+```
+
+```{r}
+# Block:构建block type
+train_simple_clear %>% 
+  mutate(block_type = str_split(Block, " ")) %>% 
+  mutate(block_type = sapply(block_type, function(x) last(unlist(x)))) %>% 
+  count(block_type, sort = TRUE) %>% 
+  mutate(proportion = n / sum(n))
+
+# 看是否有重复类别
+train_simple_clear %>% 
+  mutate(block_type = str_split(Block, " ")) %>% 
+  mutate(block_type = sapply(block_type, function(x) last(unlist(x)))) %>% 
+  count(block_type) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  arrange(block_type)
+```
+
+```{r}
+# IUCR：保留Description
+cat_per_fun(train_simple_clear, IUCR)
+
+# 和Description关系：基本一一对应
+train_simple_clear %>% 
+  group_by(IUCR) %>% 
+  summarise(unique_des = n_distinct(Description)) %>% 
+  arrange(-unique_des)
+
+# 具体对应关系，可能是数据错误
+train_simple_clear %>%
+  filter(IUCR %in% c("0810", "0820")) %>% 
+  group_by(IUCR, Description) %>% 
+  count()
+```
+
+
+```{r}
+# Primary type
+cat_per_fun(train_simple_clear, `Primary Type`)
+```
+
 
 ```{r}
 # 类别变量
@@ -87,10 +194,10 @@ cat_per_fun(train, `Community Area`)
 
 * 特征工程：根据对训练集的探索性分析做特征工程，并套用到测试集上面，有些特征可以在训练集和测试集上直接做，有些需要结合重抽样过程。有些放在recipe内，有些放在recipe外
 Date：提取年、月、日、星期几、小时，时间的格式转化可以放在recipe之前
-Block：提取街区类型，并重新归类，提取类型可以在recipe之前
-Primary Type：重新归类，放到recipe中
-Description：重新归类，放到recipe中
-Location Description：重新归类，放到recipe中
+Block：提取街区类型，并重新归类，提取类型可以在recipe之前，统一大写，去除空格
+Primary Type：重新归类，放到recipe中，统一大写，去除空格
+Description：重新归类，放到recipe中，统一大写，去除空格
+Location Description：重新归类，放到recipe中，统一大写，去除空格
 其他：暂不修改
 
 ```{r}
