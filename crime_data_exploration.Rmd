@@ -23,6 +23,7 @@ library(lubridate)
 library(foreach)
 library(doParallel)
 library(doRNG)
+library(factoextra)
 ```
 
 
@@ -98,7 +99,6 @@ train_simple_clear %>%
   geom_point() +
   geom_line() +
   scale_x_date(date_breaks = "6 months")
-    
 
 # month
 train_simple_clear %>% 
@@ -152,6 +152,35 @@ train_simple_clear %>%
   count(block_type) %>% 
   mutate(proportion = n / sum(n)) %>% 
   arrange(block_type)
+
+# 比例观察
+train_simple_clear %>% 
+  mutate(block_type = str_split(Block, " ")) %>% 
+  mutate(block_type = sapply(block_type, function(x) last(unlist(x)))) %>% 
+  count(block_type) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(proportion > 0.001) %>% 
+  select(block_type) %>% 
+  pull() -> main_block_type
+
+train_simple_clear %>% 
+  mutate(block_type = str_split(Block, " ")) %>% 
+  mutate(block_type = sapply(block_type, function(x) last(unlist(x)))) %>% 
+  mutate(block_type = if_else(block_type %in% main_block_type, block_type, "OTHER_TYPE")) %>% 
+  count(block_type, sort = TRUE) %>% 
+  mutate(proportion = n / sum(n))
+
+# 与因变量关系
+train_simple_clear %>% 
+  mutate(block_type = str_split(Block, " ")) %>% 
+  mutate(block_type = sapply(block_type, function(x) last(unlist(x)))) %>% 
+  mutate(block_type = if_else(block_type %in% main_block_type, block_type, "OTHER_TYPE")) %>% 
+  count(block_type, Arrest) %>% 
+  group_by(block_type) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(Arrest == TRUE) %>% 
+  ggplot(aes(reorder(block_type, -proportion), proportion)) +
+  geom_col()
 ```
 
 ```{r}
@@ -174,7 +203,79 @@ train_simple_clear %>%
 
 ```{r}
 # Primary type
-cat_per_fun(train_simple_clear, `Primary Type`)
+
+# 看是否有重复类别
+cat_per_fun(train_simple_clear, `Primary Type`) %>% arrange(`Primary Type`)
+
+# 比例观察
+cat_per_fun(train_simple_clear, `Primary Type`) %>% 
+  filter(proportion > 0.001) %>% 
+  select(`Primary Type`) %>% 
+  pull() -> main_primary_type
+
+train_simple_clear %>% 
+  mutate(Primary_type = if_else(`Primary Type` %in% main_primary_type, `Primary Type`, "OTHER_TYPE")) %>% 
+  count(Primary_type, Arrest) %>% 
+  group_by(Primary_type) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(Arrest == TRUE) %>% 
+  ggplot(aes(reorder(Primary_type, proportion), proportion)) +
+  geom_col() +
+  coord_flip()
+```
+
+
+```{r}
+# Description
+
+# 看是否有重复类别
+cat_per_fun(train_simple_clear, Description) %>% arrange(Description)
+
+# 比例观察
+cat_per_fun(train_simple_clear, Description) %>% 
+  filter(proportion > 0.002) %>% 
+  select(Description) %>% 
+  pull() -> main_description_type
+
+train_simple_clear %>% 
+  mutate(Description = if_else(Description %in% main_description_type, Description, "OTHER_TYPE")) %>% 
+  count(Description, Arrest) %>% 
+  group_by(Description) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(Arrest == TRUE) %>% 
+  ggplot(aes(reorder(Description, proportion), proportion)) +
+  geom_col() +
+  coord_flip()
+```
+
+```{r}
+# 分组聚类测试
+description_prop <- cat_per_fun(train_simple_clear, Description) %>% select(proportion)
+description_prop
+fviz_nbclust(description_prop, FUNcluster = kmeans, method = "wss", nstart = 10)
+kmeans(description_prop, 2, nstart = 10)
+```
+
+
+```{r}
+# Location Description
+cat_per_fun(train_simple_clear, `Location Description`) %>% arrange(`Location Description`)
+
+# 比例观察
+cat_per_fun(train_simple_clear, `Location Description`) %>% 
+  filter(proportion > 0.002) %>% 
+  select(`Location Description`) %>% 
+  pull() -> main_location_description_type
+
+train_simple_clear %>% 
+  mutate(Location_Description = if_else(`Location Description` %in% main_location_description_type, `Location Description`, "OTHER_TYPE")) %>% 
+  count(Location_Description, Arrest) %>% 
+  group_by(Location_Description) %>% 
+  mutate(proportion = n / sum(n)) %>% 
+  filter(Arrest == TRUE) %>% 
+  ggplot(aes(reorder(Location_Description, proportion), proportion)) +
+  geom_col() +
+  coord_flip()
 ```
 
 

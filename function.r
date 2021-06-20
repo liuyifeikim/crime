@@ -3,7 +3,7 @@ cat_per_fun <- function(df, var){
   qvar <- enquo(var)
   df %>% 
     count(!!qvar, sort = TRUE) %>% 
-    mutate(percent = n / sum(n))
+    mutate(proportion = n / sum(n))
 }
 
 # 抽样检查函数
