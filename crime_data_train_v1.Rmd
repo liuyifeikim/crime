@@ -1,0 +1,313 @@
+---
+title: "crime"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(usemodels)
+library(lubridate)
+library(pryr)
+library(doParallel)
+library(tictoc)
+tidymodels_prefer()
+```
+
+
+```{r}
+# 读入自定义函数
+source(file = "function.r")
+```
+
+
+```{r, message=FALSE}
+# 读入数据
+train <- read_csv("train.csv", col_names = TRUE)
+train %>% head()
+```
+
+* recipe之前的预处理：
+生成一些recipe的step没有办法生成或难以生成的变量
+删除缺失值后再抽样
+类型转换可以放到recipe当中
+
+```{r}
+# recipe前的预处理
+set.seed(100)
+train %>% 
+  filter(complete.cases(.)) %>% 
+  sample_n(size = 500000) %>% 
+  rename(Primary_type = `Primary Type`, 
+         Location_Description = `Location Description`, 
+         Community_Area = `Community Area`) %>%
+  separate(col = Date, into = c("Date", "Time", "AP"), sep = " ") %>% # 复杂处理放到recipe外处理
+  mutate(Date = mdy(Date), Time = hms(Time)) %>% 
+  mutate(Hour = if_else(AP == "PM", hour(Time) + 12, hour(Time))) %>% # recipe没有关于time的处理工具
+  mutate(Block_type = str_split(Block, " ")) %>% 
+  mutate(Block_type = sapply(Block_type, function(x) last(unlist(x)))) %>% 
+  select(-c(V1, `Case Number`, IUCR, `FBI Code`, `X Coordinate`, `Y Coordinate`, `Updated On`, 
+            Location, Block, Time, AP, Year)) %>% 
+  mutate(across(where(is.double) & !c("Latitude", "Longitude", "Date"), as.integer),
+         across(where(is.character) | where(is.logical), as.factor)) %>% 
+  mutate(Arrest = fct_relevel(Arrest, "TRUE")) %>% 
+  arrange(Date) -> train_sample
+
+# 查看结果
+train_sample %>% head()
+dim(train_sample)
+object_size(train_sample)
+
+# 删除对象
+rm(train)
+gc()
+```
+
+* tidymodels预处理部分：尽可能将过程放入这里
+
+```{r}
+# 使用recipe建立处理过程
+train_rec <- recipe(Arrest ~ ., data = train_sample) %>% 
+  update_role(ID, new_role = "ID") %>% 
+  update_role(Date, new_role = "Date") %>% 
+  step_novel(all_nominal_predictors()) %>%   # 生成一个新类型，放在前面
+  step_other(Block_type, Primary_type, threshold = 0.001, other = "OTHER_TYPE") %>%           # 前期探索分析确定
+  step_other(Description, Location_Description, threshold = 0.002, other = "OTHER_TYPE") %>%  # 前期探索分析确定
+  step_date(Date, features = c("dow", "month"), label = FALSE) %>%                            # 只保留数字
+  step_dummy(all_nominal_predictors()) %>% # 生成double类型数据
+  step_mutate_at(where(is.double) & !c("Latitude", "Longitude", "Date"), fn = as.integer)     # 解决dummy后二分数据为double的问题
+
+# 查看结果
+train_rec
+```
+
+```{r}
+# 预处理过程训练
+# train_prep <- prep(train_rec, training = train_sample) # 注意变量命名规范
+# train_prep
+# tidy(train_prep)
+# summary(train_prep)
+```
+
+
+```{r}
+# 将转换用在训练数据或者新数据上
+# train_bake <- bake(train_prep, new_data = NULL) # 用在训练集上，因为上一步prep中已经处理了训练集，因此为NULL
+# train_bake %>% head()
+# object_size(train_bake)
+```
+
+
+```{r}
+# 模型设定
+rand_forest(trees = 100) %>% # 设定通用参数，共三个，其他保持默认
+  set_engine("ranger", seed = 100, num.threads = 12, verbose = TRUE) %>%  # 设定每个库对应的参数
+  set_mode("classification") -> rf_model
+
+# 查看结果
+rf_model
+```
+
+```{r}
+# 建立工作流
+rf_wf <- workflow() %>% 
+  add_recipe(train_rec, blueprint = hardhat::default_recipe_blueprint(allow_novel_levels = TRUE)) %>%
+  add_model(rf_model)
+
+# 用工作流拟合训练数据
+set.seed(100)
+tic()
+rf_wf_fit <- rf_wf %>% fit(data = train_sample) # fit = prep + bake
+toc()
+
+# 查看结果
+rf_wf
+rf_wf_fit
+rf_wf_fit %>% pull_workflow_fit()
+```
+
+* 实现K折交叉检验：先不管年份
+
+```{r}
+# 建立K折数据
+set.seed(100)
+cv_5 <- vfold_cv(train_sample, v = 5, strata = Arrest)
+cv_5
+```
+
+```{r}
+# 重抽样计算
+ctrl <- control_resamples(verbose = TRUE, event_level = "second", allow_par = TRUE, parallel_over = "everything")
+cl <- makeCluster(12)
+registerDoParallel(cl)
+set.seed(100)
+tic()
+rf_wf_cv_5 <- rf_wf %>% fit_resamples(resamples = cv_5, 
+                                      metrics = metric_set(roc_auc),
+                                      control = ctrl)
+toc()
+stopCluster(cl)
+```
+
+
+```{r}
+# 查看结果
+rf_wf_cv_5 %>% collect_metrics()
+```
+
+* 按时间进行滚动交叉检验:
+https://github.com/tidymodels/rsample/issues/42
+https://stackoverflow.com/questions/51925991/combining-rolling-origin-forecast-resampling-and-group-v-fold-cross-validation-i
+https://stackoverflow.com/questions/64820223/combine-nesting-and-rolling-origin-from-tidymodels-in-r
+https://rsample.tidymodels.org/reference/slide-resampling.html
+
+```{r}
+# 划分数据集
+cv_rolling <- train_sample %>% sliding_period(index = Date, period = "year", lookback = 3, assess_stop = 2) 
+cv_rolling$splits
+```
+
+```{r}
+# 重抽样检验
+cl <- makeCluster(12)
+registerDoParallel(cl)
+set.seed(100)
+tic()
+rf_wf_cv_rolling <- rf_wf %>% fit_resamples(resamples = cv_rolling, 
+                                            metrics = metric_set(roc_auc), 
+                                            control = ctrl)
+toc()
+stopCluster(cl)
+```
+
+
+```{r}
+# 观察性能
+rf_wf_cv_rolling %>% collect_metrics()
+```
+
+* 超参数调整:
+
+Grid search:
+tune_grid
+
+Regular grids：
+grid_regular：可以实现等距空间网格
+crossing：给定参数组合
+
+Irregular grids：
+grid_random
+grid_latin_hypercube
+
+
+Iterative search:
+tune_bayes()
+
+```{r}
+# 设定需要调整的参数：某些参数可能需要finalize或update确定范围
+rand_forest(trees = 100, min_n = tune(), mtry = tune()) %>%
+  set_engine("ranger", seed = 100, num.threads = 12, verbose = TRUE) %>%  # 设定每个库对应的参数
+  set_mode("classification") -> rf_model_tune
+rf_model_tune
+parameters(rf_model_tune) # 有一个参数范围待确定
+```
+
+```{r}
+# 建立调参工作流
+rf_wf %>% 
+  update_model(rf_model_tune) -> rf_wf_tune
+rf_wf_tune
+```
+
+```{r}
+# 设定范围和间隔
+regular_grid <- grid_regular(
+  mtry(range = c(1, 70)),
+  min_n(range = c(1, 20)),
+  levels = 3
+  )
+regular_grid
+
+# 设定范围和间隔，在给定范围中进行随机抽样
+random_grid <- grid_random(
+  mtry(c(1, 70)),
+  min_n(c(1, 20)),
+  size = 10
+  )
+random_grid
+
+# 直接给定数据点
+cross_grid <- crossing(
+  mtry = c(1, 70),
+  min_n = c(1, 20)
+)
+cross_grid
+
+# 确定经过预处理后的参数的范围：貌似不能确定
+# rf_wf_tune %>% 
+#   parameters() %>% 
+#   finalize(train_sample) -> finalize_param # 不能指定
+# finalize_param
+# finalize_param %>% pull_dials_object("mtry")
+# finalize_param %>% pull_dials_object("min_n")
+
+workflow() %>% 
+  add_recipe(train_rec) %>% 
+  add_model(rf_model_tune) %>% 
+  parameters() %>% 
+  update(mtry = mtry(c(1, 70))) -> finalize_param # 手工update
+finalize_param %>% pull_dials_object("mtry")
+
+# 根据finalize得到的范围自动选择，finalize的结果要正确
+finalize_param %>% grid_regular(levels = 3)
+finalize_param %>% grid_regular(levels = c(min_n = 3, mtry = 5))
+finalize_param %>% grid_regular(min_n(), mtry(), levels = 3)
+```
+
+
+```{r}
+mtry()
+min_n()
+```
+
+
+```{r}
+# 参数调整：非常耗时
+cl <- makeCluster(12)
+registerDoParallel(cl)
+set.seed(100)
+tic()
+rf_wf_tune_res <- tune_grid(object = rf_wf_tune,
+                            resamples = cv_rolling,
+                            grid = 20,
+                            control = ctrl,
+                            metrics = metric_set(roc_auc)
+                            )
+toc()
+stopCluster(cl)
+```
+
+```{r}
+# 查看结果：mtry范围正确
+rf_wf_tune_res %>% collect_metrics()
+rf_wf_tune_res %>% select_best("roc_auc")
+# rf_wf_tune_res %>% show_best("roc_auc", n = 3)  # 最好的n个结果
+```
+
+
+```{r}
+# 将最优结果用在全部训练数据上，得到最终模型
+rf_wf_final <- rf_wf_tune %>% finalize_workflow(select_best(rf_wf_tune_res))
+rf_wf_final
+rf_wf_final_fit <- rf_wf_final %>% fit(train_sample)
+rf_wf_final_fit %>% pull_workflow_fit()
+rf_wf_final_fit %>% pull_workflow_prepped_recipe()
+rf_wf_final_fit %>% pull_workflow_spec()
+rf_wf_final_fit %>% pull_workflow_mold()
+```
+
+```{r}
+# 保存模型
+saveRDS(rf_wf_final_fit, "rf_wf_final_fit.rds")
+```
+

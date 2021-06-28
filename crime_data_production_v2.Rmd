@@ -1,0 +1,25 @@
+---
+title: "crime"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(lubridate)
+library(tictoc)
+```
+
+
+```{r}
+source("function.r")
+```
+
+
+```{r}
+# 结果预测
+tic()
+production_prediction <- production_prediction_fun("prod.csv")
+toc()
+production_prediction
+```

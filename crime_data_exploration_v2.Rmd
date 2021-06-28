@@ -24,6 +24,9 @@ library(foreach)
 library(doParallel)
 library(doRNG)
 library(factoextra)
+library(tictoc)
+library(groupdata2)
+library(tidymodels)
 ```
 
 
@@ -52,7 +55,6 @@ X Coordinate, y Coordinate和Latitude及Longitude及Location基本对应，保�
 保留完整数据，不考虑缺失数据
 IUCR可能和Description一一对应
 
-
 ```{r}
 # 观察整体情况
 skim(train)
@@ -63,7 +65,6 @@ skim(train)
 删除缺失很多的列：暂时没有缺失很多的列，缺失较多的列也是需要的列
 保留完整样本
 对类型进行初步转化，不用太精准，后面还会再变化
-
 
 ```{r}
 # 删除没有用的列，缺失值不多，保留完整数据
@@ -384,135 +385,112 @@ Location Description：重新归类，放到recipe中，统一大写，去除空
 可以转为整数的转为整数
 
 ```{r}
-# 时间特征
+# recipe前的预处理
 train %>% 
-  select(-c(V1, `Case Number`, `X Coordinate`, `Y Coordinate`, `Updated On`, Location, Year)) %>% 
+  select(-c(V1, `Case Number`, `X Coordinate`, `Y Coordinate`, `Updated On`, Location, Year, IUCR)) %>% 
   filter(complete.cases(.)) %>% 
-  separate(col = Date, into = c("date", "time", "ap"), sep = " ") %>% 
-  mutate(date = mdy(date), time = hms(time)) %>% 
-  mutate(month = month(date),
-         wday = wday(date),
-         hour = if_else(ap == "PM", hour(time) + 12, hour(time))) %>% 
-  select(-c(date, time, ap)) -> train_feature
+  separate(col = Date, into = c("Date", "Time", "AP"), sep = " ") %>% 
+  mutate(Date = mdy(Date), Time = hms(Time)) %>% 
+  mutate(Month = month(Date),
+         Wday = wday(Date),
+         Hour = if_else(AP == "PM", hour(Time) + 12, hour(Time))) %>% 
+  select(-c(Time, AP)) %>% 
+  mutate(Block_type = str_split(Block, " ")) %>% 
+  mutate(Block_type = sapply(Block_type, function(x) last(unlist(x)))) %>% 
+  select(-Block) %>% 
+  mutate(across(where(is.double) & -c(Date, Longitude, Latitude), as.integer),
+         across(where(is.logical), as_factor)) %>% 
+  mutate(Arrest = fct_relevel(Arrest, "TRUE")) %>% 
+  arrange(Date) -> train_feature
 
 # 查看结果
 train_feature %>% head()
-```
-
-
-```{r}
-# Block
-
-# 提取最后一个词：放到recipe外
-train_feature %>% 
-  mutate(block_type = str_split(Block, " ")) %>% 
-  mutate(block_type = sapply(block_type, function(x) last(unlist(x)))) %>% 
-  select(-Block) -> train_feature
-
-# 查看结果，将少类别归为其他类
-train_feature %>% head()
-cat_per_fun(train_feature, block_type) %>% 
-  filter(percent > 0.001) %>% 
-  select(block_type) %>% 
-  pull() -> main_block_type
-main_block_type
-
-# 类型调整
-train_feature %>% 
-  mutate(block_type = if_else(block_type %in% main_block_type, block_type, "OTHER")) -> train_feature
-
-# 查看结果
-train_feature %>% 
-  count(block_type, sort = TRUE) %>% 
-  mutate(percent = n / sum(n))
-```
-
-
-```{r}
-# Primary Type
-
-# 整合少数类
-cat_per_fun(train_feature, `Primary Type`) %>% 
-  filter(percent > 0.001) %>% 
-  select(`Primary Type`) %>% 
-  pull() -> main_primary_type
-main_primary_type
-
-# 类型调整
-train_feature %>% 
-  mutate(primary_type = if_else(`Primary Type` %in% main_primary_type, `Primary Type`, "OTHER")) %>% 
-  select(-`Primary Type`) -> train_feature
-
-# 查看结果
-train_feature %>% 
-  count(primary_type, sort = TRUE) %>% 
-  mutate(percent = n / sum(n))
-```
-
-```{r}
-# Description
-cat_per_fun(train_feature, Description) %>% 
-  filter(percent > 0.002) %>% 
-  select(Description) %>% 
-  pull() -> main_description
-main_description
-
-# 类型调整
-train_feature %>% 
-  mutate(description = if_else(Description %in% main_description, Description, "OTHER")) %>% 
-  select(-Description) -> train_feature
-
-# 查看结果
-train_feature %>% 
-  count(description, sort = TRUE) %>% 
-  mutate(percent = n / sum(n))
-```
-
-```{r}
-# Location Description
-cat_per_fun(train_feature, `Location Description`) %>% 
-  filter(percent > 0.002) %>% 
-  select(`Location Description`) %>% 
-  pull() -> main_location_description
-main_location_description
-
-# 类型调整
-train_feature %>% 
-  mutate(location_description = if_else(`Location Description` %in% main_location_description, `Location Description`, "OTHER")) %>% 
-  select(-`Location Description`) -> train_feature
-
-# 查看结果
-train_feature %>% 
-  count(location_description, sort = TRUE) %>% 
-  mutate(percent = n / sum(n))
 ```
 
 抽样评估：样本中各个类别的取值基本能够保留全样本的信息，没有类别丢失。
+计算每个抽样比例下各变量类别数
+将过程重复N次，计算每个变量每个抽样比例下的类别均值
+计算每个抽样比例下各个样本类别数的总均值，找到肘部点
+
 
 ```{r}
-train_feature %>% head()
-```
-
-```{r}
-# 测试抽样结果中每个变量的类别情况
-registerDoParallel(cores = 12)
+#测试抽样结果中每个变量的类别情况
+dis_full <- train_feature %>% select(-ID, -Date) %>% lapply(n_distinct) %>% as_tibble()
+cl <- makeCluster(12)
+registerDoParallel(cl)
 registerDoRNG(100)
 sample_test <- foreach(i = seq(from = 1, to = 0.02, by = -0.02),
                        .combine = "rbind",
-                       .packages = "dplyr") %dopar% cat_sample_fun(train_feature, i)
-stopImplicitCluster()
+                       .packages = "dplyr") %dopar% cat_sample_prop_fun(train_feature, i)
+stopCluster(cl)
 sample_test
 ```
 
 
+
 ```{r}
-# set.seed(100)
-# train_feature %>% 
-#   sample_n(size = 1000000) -> train_sample
-# cat_sample_fun(train_sample, 1)
+# 将上述过程重复10次
+cl <- makeCluster(12)
+registerDoParallel(cl)
+tic()
+sample_test_rep <- replicate(10, 
+                             {foreach(i = seq(from = 1, to = 0.02, by = -0.02),
+                                     .combine = "rbind",
+                                     .packages = "dplyr",
+                                     .export = c("train_feature", "dis_full", "cat_sample_prop_fun")) %dopar% cat_sample_prop_fun(train_feature, i)},
+                             simplify = FALSE)
+toc()
+stopCluster(cl)
+sample_test_rep
+```
+
+
+```{r, fig.height=15, fig.width=15}
+sample_test_rep %>% 
+  bind_rows() %>% 
+  group_by(size) %>% 
+  summarise(across(everything(), mean)) %>% 
+  arrange(-size) %>% 
+  select(-c(n, Arrest, Domestic, Latitude, Longitude, Month, Wday, Hour, `Community Area`, Ward)) %>% 
+  pivot_longer(!size, names_to = "feature", values_to = "value") %>% 
+  ggplot(aes(size, value)) + 
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ feature, ncol = 1, scales = "free_y") +
+  scale_x_reverse(breaks = seq(from = 1, to = 0, by = -0.04))
+```
+
+* 抽样比例大概为0.2的时候开始下降非常快，0.2为肘部点。约为50万。
+
+```{r, fig.height=7, fig.width=15}
+sample_test_rep %>% 
+  bind_rows() %>% 
+  group_by(size) %>% 
+  summarise(across(everything(), mean)) %>% 
+  arrange(-size) %>% 
+  select(-c(n, Arrest, Domestic, Latitude, Longitude, Month, Wday, Hour, `Community Area`, Ward)) %>% 
+  mutate(Mean = rowMeans(.[,2:8])) %>% 
+  ggplot(aes(size, Mean)) + 
+  geom_line() +
+  geom_point() +
+  scale_x_reverse(breaks = seq(from = 1, to = 0, by = -0.04))
+```
+
+
+```{r}
+train %>% select(ID, Arrest, Ward) %>% sample_n(10000) %>% mutate(Ward = as.factor(Ward)) -> train_ward
+train_ward %>% filter(is.na(Ward))
+```
+
+
+```{r}
+ward_rec <- recipe(Arrest ~ Ward, data = train_ward) %>% step_unknown(Ward) %>% step_impute_mode(Ward)
+ward_prep <- prep(ward_rec, training = train_ward)
+ward_bake <- bake(ward_prep, new_data = NULL)
 ```
 
 ```{r}
-rm(list = ls())
+levels(ward_bake$Ward)
+ward_bake %>% filter(Ward == "unknown")
 ```
 

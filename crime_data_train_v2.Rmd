@@ -1,0 +1,381 @@
+---
+title: "crime"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+library(usemodels)
+library(lubridate)
+library(pryr)
+library(doParallel)
+library(tictoc)
+library(embed)
+library(skimr)
+tidymodels_prefer()
+```
+
+
+```{r}
+# 读入自定义函数
+source(file = "function.r")
+```
+
+
+```{r, message=FALSE}
+# 读入数据
+train <- read_csv("train.csv", col_names = TRUE)
+train %>% head()
+```
+
+* recipe之前的预处理：
+生成一些recipe的step没有办法生成或难以生成的变量
+删除缺失值后再抽样
+类型转换可以放到recipe当中
+
+```{r}
+# recipe前的预处理
+set.seed(100)
+train %>% 
+  filter(complete.cases(.)) %>% 
+  sample_n(size = 500000) %>% 
+  rename(Primary_type = `Primary Type`, 
+         Location_description = `Location Description`, 
+         Community_area = `Community Area`,
+         FBI_code = `FBI Code`) %>%
+  separate(col = Date, into = c("Date", "Time", "AP"), sep = " ") %>% # 复杂处理放到recipe外处理
+  mutate(Date = mdy(Date), Time = hms(Time)) %>% 
+  mutate(Month = month(Date, label = FALSE),
+         Wday = wday(Date, label = FALSE),
+         Hour = if_else(AP == "PM", hour(Time) + 12, hour(Time))) %>% # recipe没有关于time的处理工具
+  mutate(Block_type = str_split(Block, " ")) %>% 
+  mutate(Block_type = sapply(Block_type, function(x) last(unlist(x)))) %>% 
+  select(-c(V1, `Case Number`, IUCR, `X Coordinate`, `Y Coordinate`, `Updated On`, 
+            Location, Block, Time, AP, Year)) %>% 
+  mutate(across(c("Beat", "District", "Ward", "Community_area"), as.factor),
+         across(where(is.character) | where(is.logical), as.factor),
+         across(where(is.double) & !c("Latitude", "Longitude", "Date"), as.integer)) %>% 
+  mutate(Arrest = fct_relevel(Arrest, "TRUE")) %>% 
+  arrange(Date) -> train_sample
+
+# 查看结果
+train_sample %>% head()
+dim(train_sample)
+glimpse(train_sample)
+object_size(train_sample)
+levels(train_sample$Arrest)
+
+# 删除对象
+rm(train)
+gc()
+```
+
+```{r}
+skim(train_sample)
+```
+
+
+* tidymodels预处理部分：将有可能产生数据泄露的步骤放在这里
+类别变量监督编码：https://embed.tidymodels.org/
+将类别变为对数偶值(log odds)，即每一类为log(每类中因变量正样本/每类中因变量负样本)，根据glm的结果，各类别对数偶值减去参照组对数偶值即为模型的系数：https://embed.tidymodels.org/reference/step_lencode_glm.html
+
+```{r}
+# glm
+train_glm_rec <- recipe(Arrest ~ ., data = train_sample) %>% 
+  update_role(ID, new_role = "ID") %>%
+  update_role(Date, new_role = "Date") %>%
+  step_novel(all_nominal_predictors(), new_level = "NEW") %>%     # 生成一个新类型，最好放在前面  
+  step_other(Primary_type, Block_type, threshold = 0.001, other = "OTHER_TYPE") %>%   # 前期探索分析确定
+  step_other(Description, Location_description, threshold = 0.002, other = "OTHER_TYPE") %>%   # 前期探索分析确定
+  step_lencode_glm(all_nominal_predictors(), outcome = vars(Arrest))
+
+# glm + downsample
+train_glm_ds_rec <- recipe(Arrest ~ ., data = train_sample) %>% 
+  update_role(ID, new_role = "ID") %>% 
+  update_role(Date, new_role = "Date") %>% 
+  step_downsample(Arrest, under_ratio = 1, seed = 100, skip = TRUE) %>%  # 将抽样调整放在预处理之前
+  step_novel(all_nominal_predictors(), new_level = "NEW") %>%     # 生成一个新类型，最好放在前面  
+  step_other(Primary_type, Block_type, threshold = 0.001, other = "OTHER_TYPE") %>%   # 前期探索分析确定
+  step_other(Description, Location_description, threshold = 0.002, other = "OTHER_TYPE") %>%   # 前期探索分析确定
+  step_lencode_glm(all_nominal_predictors(), outcome = vars(Arrest))
+
+# dummy
+train_dummy_rec <- recipe(Arrest ~ ., data = train_sample) %>% 
+  update_role(ID, new_role = "ID") %>% 
+  update_role(Date, new_role = "Date") %>% 
+  step_novel(all_nominal_predictors(), new_level = "NEW") %>%     # 生成一个新类型，最好放在前面  
+  step_other(Primary_type, Block_type, threshold = 0.001, other = "OTHER_TYPE") %>%   # 前期探索分析确定
+  step_other(Description, Location_description, threshold = 0.002, other = "OTHER_TYPE") %>%   # 前期探索分析确定
+  step_dummy(all_nominal_predictors())
+
+# dummy + downsample
+train_dummy_ds_rec <- recipe(Arrest ~ ., data = train_sample) %>% 
+  update_role(ID, new_role = "ID") %>% 
+  update_role(Date, new_role = "Date") %>% 
+  step_downsample(Arrest, under_ratio = 1, seed = 100, skip = TRUE) %>%  # 将抽样调整放在预处理之前
+  step_novel(all_nominal_predictors(), new_level = "NEW") %>%     # 生成一个新类型，最好放在前面  
+  step_other(Primary_type, Block_type, threshold = 0.001, other = "OTHER_TYPE") %>%   # 前期探索分析确定
+  step_other(Description, Location_description, threshold = 0.002, other = "OTHER_TYPE") %>%   # 前期探索分析确定
+  step_dummy(all_nominal_predictors())
+
+# 查看结果
+train_glm_rec
+train_glm_ds_rec
+train_dummy_rec
+train_dummy_ds_rec
+```
+
+```{r}
+# 预处理过程训练，并保存相关信息
+tic()
+train_prep <- prep(train_glm_rec, training = train_sample) # 注意变量命名规范
+toc()
+train_prep
+tidy(train_prep)
+summary(train_prep)
+```
+
+
+```{r}
+# 将转换用在训练数据或者新数据上
+train_bake <- bake(train_prep, new_data = NULL) # 用在训练集上，因为上一步prep中已经处理了训练集，因此为NULL
+train_bake %>% head()
+object_size(train_bake)
+```
+
+```{r}
+# 预处理过程训练
+tic()
+train_ds_prep <- prep(train_glm_ds_rec, training = train_sample) # 注意变量命名规范
+toc()
+train_ds_prep
+tidy(train_ds_prep)
+summary(train_ds_prep)
+```
+
+
+```{r}
+# 用在训练集上，因为上一步prep中已经处理了训练集，因此为NULL
+train_ds_bake <- bake(train_ds_prep, new_data = NULL) 
+train_ds_bake %>% count(Arrest)
+```
+
+
+```{r}
+# train_sample %>% head()
+# train_sample %>% count(Domestic, Arrest)
+# train_sample %>% count(Primary_type, Arrest)
+# train_bake %>% distinct(Primary_type)
+# train_bake %>% distinct(Domestic)
+```
+
+```{r}
+# glm:将第二个level定为阳性样本，因此系数和手动计算的相反
+# tic()
+# glm_model <- glm(Arrest ~ Description, data = train_sample, family = "binomial")
+# toc()
+# summary(glm_model)
+```
+
+
+```{r}
+# 模型设定
+rand_forest(trees = 100) %>% # 设定通用参数，共三个，其他保持默认
+  set_engine("ranger", seed = 100, num.threads = 12, verbose = TRUE) %>%  # 设定每个库对应的参数
+  set_mode("classification") -> rf_model
+
+# 查看结果
+rf_model
+```
+
+```{r}
+# 建立工作流
+rf_wf <- workflow() %>% 
+  add_recipe(train_rec, blueprint = hardhat::default_recipe_blueprint(allow_novel_levels = TRUE)) %>%
+  add_model(rf_model)
+
+# 用工作流拟合训练数据
+set.seed(100)
+tic()
+rf_wf_fit <- rf_wf %>% fit(data = train_sample) # fit = prep + bake
+toc()
+
+# 查看结果
+rf_wf
+rf_wf_fit
+rf_wf_fit %>% pull_workflow_fit()
+```
+
+
+* 按时间进行滚动交叉检验:
+https://github.com/tidymodels/rsample/issues/42
+https://stackoverflow.com/questions/51925991/combining-rolling-origin-forecast-resampling-and-group-v-fold-cross-validation-i
+https://stackoverflow.com/questions/64820223/combine-nesting-and-rolling-origin-from-tidymodels-in-r
+https://rsample.tidymodels.org/reference/slide-resampling.html
+
+```{r}
+# 划分数据集
+cv_rolling <- train_sample %>% sliding_period(index = Date, period = "year", lookback = 3, assess_stop = 2) 
+cv_rolling$splits
+```
+
+```{r}
+# 重抽样检验
+ctrl <- control_resamples(verbose = TRUE, parallel_over = "everything")
+cl <- makeCluster(5)
+registerDoParallel(cl)
+set.seed(100)
+tic()
+rf_wf_cv_rolling <- rf_wf %>% fit_resamples(resamples = cv_rolling, 
+                                            metrics = metric_set(roc_auc), 
+                                            control = ctrl)
+toc()
+stopCluster(cl)
+```
+
+
+```{r}
+# 观察性能
+rf_wf_cv_rolling %>% collect_metrics()
+```
+
+* 比较不同预处理过程下的模型性能
+
+```{r}
+# 设定不同的与处理方案
+rec_list <- list(glm = train_glm_rec,
+                 glm_downsample = train_glm_ds_rec,
+                 dummy = train_dummy_rec,
+                 dummy_downsample = train_dummy_ds_rec)
+rec_list
+
+# 对不同的方案设定模型（不训练模型）
+rf_model_recs <- workflow_set(preproc = rec_list, models = list(rf = rf_model), cross = FALSE)
+rf_model_recs
+
+# 重抽样
+cl <- makeCluster(5)
+registerDoParallel(cl)
+set.seed(100)
+tic()
+rf_model_recs_compare <- rf_model_recs %>% 
+  workflow_map(fn = "fit_resamples", 
+               seed = 100, verbose = TRUE,   # Options to `workflow_map()`
+               resamples = cv_rolling, metrics = metric_set(roc_auc), control = ctrl)  # Options to `fit_resamples()`
+toc()
+stopCluster(cl)
+
+# 查看结果
+rf_model_recs_compare
+```
+
+```{r}
+# 查看性能
+rf_model_recs_compare %>% collect_metrics()
+```
+
+```{r}
+rf_model_recs_compare$result[[1]]
+```
+
+
+* 超参数调整:
+
+Grid search:
+tune_grid
+
+Regular grids：
+grid_regular：可以实现等距空间网格
+crossing：给定参数组合
+
+Irregular grids：
+grid_random
+grid_latin_hypercube
+
+
+Iterative search:
+tune_bayes()
+
+```{r}
+# 设定需要调整的参数：某些参数可能需要finalize或update确定范围
+rand_forest(trees = 100, min_n = tune(), mtry = tune()) %>%
+  set_engine("ranger", seed = 100, num.threads = 12, verbose = TRUE) %>%  # 设定每个库对应的参数
+  set_mode("classification") -> rf_model_tune
+rf_model_tune
+parameters(rf_model_tune) # 有一个参数范围待确定
+```
+
+```{r}
+# 建立调参工作流
+rf_wf %>% 
+  update_recipe(train_glm_ds_rec) %>% 
+  update_model(rf_model_tune) -> rf_wf_tune
+rf_wf_tune
+```
+
+```{r}
+# 确定经过预处理后的参数的范围：貌似不能确定
+rf_wf_tune %>%
+  parameters() %>%
+  finalize(train_sample) -> finalize_param # 不能指定
+finalize_param
+finalize_param %>% pull_dials_object("mtry")
+finalize_param %>% pull_dials_object("min_n")
+
+workflow() %>% 
+  add_recipe(train_glm_ds_rec) %>% 
+  add_model(rf_model_tune) %>% 
+  parameters() %>% 
+  update(mtry = mtry(c(1, 15))) -> finalize_param # 手工update
+finalize_param %>% pull_dials_object("mtry")
+
+# 根据finalize得到的范围自动选择，finalize的结果要正确
+finalize_param %>% grid_regular(levels = 3)
+finalize_param %>% grid_regular(levels = c(min_n = 3, mtry = 5))
+finalize_param %>% grid_regular(min_n(), mtry(), levels = 3)
+```
+
+
+```{r}
+# 参数调整：非常耗时
+cl <- makeCluster(5)
+registerDoParallel(cl)
+set.seed(100)
+tic()
+rf_wf_tune_res <- tune_grid(object = rf_wf_tune,
+                            resamples = cv_rolling,
+                            grid = 20,
+                            control = ctrl,
+                            metrics = metric_set(roc_auc)
+                            )
+toc()
+stopCluster(cl)
+```
+
+
+
+```{r}
+# 查看结果：mtry范围正确
+rf_wf_tune_res %>% collect_metrics()
+rf_wf_tune_res %>% select_best("roc_auc")
+# rf_wf_tune_res %>% show_best("roc_auc", n = 3)  # 最好的n个结果
+```
+
+
+```{r}
+# 将最优结果用在全部训练数据上，得到最终模型
+rf_wf_final <- rf_wf_tune %>% finalize_workflow(select_best(rf_wf_tune_res))
+rf_wf_final
+rf_wf_final_fit <- rf_wf_final %>% fit(train_sample)
+rf_wf_final_fit %>% pull_workflow_fit()
+rf_wf_final_fit %>% pull_workflow_prepped_recipe()
+rf_wf_final_fit %>% pull_workflow_spec()
+rf_wf_final_fit %>% pull_workflow_mold()
+```
+
+```{r}
+# 保存模型
+saveRDS(rf_wf_final_fit, "rf_wf_final_fit_new.rds")
+```
+
