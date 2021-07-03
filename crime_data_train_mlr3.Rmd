@@ -1,0 +1,276 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r, message=FALSE}
+library(tidyverse)
+library(mlr3verse)
+library(paradox)
+library(mlr3temporal)
+library(skimr)
+library(tictoc)
+library(future)
+```
+
+
+```{r}
+mlr3verse_info()
+```
+
+
+```{r}
+as.data.table(mlr_learners)
+as.data.table(mlr_resamplings)
+as.data.table(mlr_measures)
+as.data.table(mlr_pipeops) # https://mlr3pipelines.mlr-org.com/reference/index.html
+as.data.table(mlr_filters) # https://mlr3filters.mlr-org.com/reference/index.html
+```
+
+```{r, message=FALSE}
+# 数据读入
+train_sample <- read_csv("../train_sample.csv")
+train_sample <- train_sample %>% 
+    mutate(
+      across(c(Beat, District, Ward, Community_area), as.factor),
+      across(where(is.double) & -c(Date, Latitude, Longitude), as.integer),
+      across(where(is.character) | where(is.logical), as.factor),
+      Arrest = fct_relevel(Arrest, "TRUE"),
+      Date = as.POSIXct(as.character(Date), format = "%Y-%m-%d")) %>%  # task转换不支持date格式
+  select(-ID, -Date)
+train_sample
+levels(train_sample$Arrest)
+```
+
+
+```{r, message=FALSE}
+test_sample <- read_csv("../test_sample.csv")
+test_sample <- test_sample %>% 
+    mutate(
+      across(c(Beat, District, Ward, Community_area), as.factor),
+      across(where(is.double) & -c(Date, Latitude, Longitude), as.integer),
+      across(where(is.character) | where(is.logical), as.factor),
+      Arrest = fct_relevel(Arrest, "TRUE"),
+      Date = as.POSIXct(as.character(Date), format = "%Y-%m-%d")) %>%  # task转换不支持date格式
+  select(-ID, -Date)
+test_sample
+levels(test_sample$Arrest)
+```
+
+
+```{r}
+skim(train_sample)
+```
+
+预处理策略：
+排除ID
+根据重抽样处理Date
+对因子类变量进行哑变量和非哑变量编码
+
+```{r}
+# 转换为task
+task_train_sample <- TaskClassif$new(id = "train", backend = train_sample, target = "Arrest", positive = "TRUE")
+task_train_sample
+task_train_sample$data()
+
+task_test_sample <- TaskClassif$new(id = "test", backend = test_sample, target = "Arrest", positive = "TRUE")
+task_test_sample
+task_test_sample$data()
+```
+
+
+
+```{r}
+# 一些组件的测试
+po("fixfactors", affect_columns = selector_type("factor"))
+poe <- po("encode", method = "treatment", affect_columns = selector_name("Primary_type"))
+poei <- po("encodeimpact", affect_columns = selector_name("Primary_type"))
+poci <- po("classbalancing", id = "undersample", ratio = 1)   # 两类对半分
+poci <- po("classbalancing", id = "undersample", reference = "minor", ratio = 1)                   # 将多数类变为与少数类相等
+poci <- po("classbalancing", id = "undersample", reference = "minor", adjust = "major", ratio = 1) # 将多数类变为与少数类相等
+poci <- po("classbalancing", id = "undersample", reference = "minor", adjust = "major", ratio = 2) # 将多数类变为少数类2倍
+poci <- po("classbalancing", id = "undersample", reference = "major", adjust = "minor", ratio = 1) # 将少数类变为与多数类相等
+table(poci$train(list(task_train_sample))$output$truth())
+poe$train(list(task_train_sample))[[1]]$data()
+```
+
+
+```{r}
+# 建立流程图
+graph <- 
+  po("fixfactors", affect_columns = selector_type("factor")) %>>%
+  po("imputemode") %>>%
+  po("encodeimpact", affect_columns = selector_type("factor")) %>>%
+  po("select", affect_columns = selector_invert(selector_grep("FALSE$"))) %>>%
+  lrn("classif.ranger", num.trees = 100, predict_type = "prob")
+graph
+graph$plot()
+```
+
+```{r}
+# 转为学习器
+graph_lrn <- as_learner(graph)
+graph_lrn
+```
+
+
+```{r}
+# 模型训练
+graph_lrn$train(task_train_sample)
+graph_lrn
+```
+
+```{r}
+# 交叉检验
+task_train_sample_cv_5 <- resample(
+  task = task_train_sample, 
+  learner = graph_lrn,
+  resampling = rsmp("cv", folds = 5))
+```
+
+```{r}
+# 查看性能
+task_train_sample_cv_5$aggregate(msr("classif.auc"))
+```
+
+```{r}
+# 预测测试集
+graph_lrn_predict <- graph_lrn$predict(task = task_test_sample)
+graph_lrn_predict
+graph_lrn_predict$score(msr("classif.auc"))
+```
+
+
+```{r}
+# 建立有branch的过程
+p1 <- 
+  po("branch", c("nop", "classbalancing"), id = "sampling_branch") %>>%
+  gunion(list(
+    po("nop"),
+    po("classbalancing", id = "undersample", reference = "minor", adjust = "major", ratio = 1)
+  )) %>>%
+  po("unbranch", id = "sampling_unbranch")
+p1$plot()
+
+p2 <- 
+  po("fixfactors", affect_columns = selector_type("factor")) %>>%
+  po("imputemode") %>>%
+  po("encodeimpact", affect_columns = selector_type("factor")) %>>%
+  po("select", affect_columns = selector_invert(selector_grep("FALSE$")))
+p2$plot()
+
+p3 <- 
+  po("branch", c("classif.log_reg", "classif.ranger"), id = "lrn_branch") %>>%
+  gunion(list(
+    lrn("classif.log_reg", predict_type = "prob"),
+    lrn("classif.ranger", num.trees = 100, predict_type = "prob")
+  )) %>>%
+  po("unbranch", id = "lrn_unbranch")
+p3$plot()
+
+# 构成学习器
+graph_branch <- p1 %>>% p2 %>>% p3 
+graph_branch_lrn <- as_learner(graph_branch)
+graph_branch_lrn$graph$plot()
+```
+
+```{r}
+graph_branch_lrn$param_set
+graph_branch_lrn$param_set$params$undersample.reference$levels
+graph_branch_lrn$param_set$params$undersample.adjust$levels
+graph_branch_lrn$param_set$params$undersample.ratio
+```
+
+```{r}
+# 设定参数集合
+tune_grid <- ParamSet$new(
+  list(
+  ParamFct$new("sampling_branch.selection", levels = c("nop", "classbalancing")),
+  ParamFct$new("undersample.reference", levels = c("minor")),
+  ParamFct$new("undersample.adjust", levels = c("major")),
+  ParamInt$new("undersample.ratio", lower = 1, upper = 5),
+  ParamFct$new("lrn_branch.selection", levels = c("classif.log_reg", "classif.ranger")),
+  ParamLgl$new("classif.ranger.replace"),
+  ParamInt$new("classif.ranger.mtry", lower = 1, upper = 8)
+  ))
+tune_grid$add_dep("undersample.reference", "sampling_branch.selection", CondEqual$new("classbalancing"))
+tune_grid$add_dep("undersample.adjust", "undersample.reference", CondEqual$new("minor"))
+tune_grid$add_dep("undersample.ratio", "undersample.adjust", CondEqual$new("major"))
+tune_grid$add_dep("classif.ranger.replace", "lrn_branch.selection", CondEqual$new("classif.ranger"))
+tune_grid$add_dep("classif.ranger.mtry", "lrn_branch.selection", CondEqual$new("classif.ranger"))
+tune_grid
+```
+
+```{r}
+# 重抽样方案
+resampling_inner <- rsmp("cv", folds = 5)
+resampling_outer <- rsmp("cv", folds = 3)
+
+# 内层重抽样
+at <- AutoTuner$new(
+  learner = graph_branch_lrn,
+  resampling = resampling_inner,
+  measure = msr("classif.auc"),
+  search_space = tune_grid,
+  tuner = tnr("random_search"),
+  terminator = trm("evals", n_evals = 20),
+  store_tuning_instance = TRUE)
+
+# 外层重抽样
+plan(list("multisession", "multisession"))
+set.seed(100)
+tic()
+rr_at <- resample(
+  task = task_train_sample,
+  learner = at,
+  resampling = resampling_outer, 
+  store_models = TRUE)
+toc()
+plan(sequential)
+```
+
+
+```{r}
+# 查看结果
+rr_at
+```
+
+
+
+
+
+
+
+
+
+
+
+
+* 根据时间窗口实现K折交叉检验：
+https://mlr3temporal.mlr-org.com/reference/mlr_resamplings_RollingWindowCV.html
+https://github.com/mlr-org/mlr3temporal
+
+```{r}
+# 交叉检验
+rolling_cv <- resample(
+  task = train_sample_task, 
+  learner = lrn("classif.ranger", num.trees = 100, mtry = 3, predict_type = "prob"), 
+  resampling = rsmp("RollingWindowCV", folds = 5, fixed_window = F), 
+  store_models = TRUE)
+```
+
+
+```{r}
+task = tsk("petrol")
+learner = LearnerRegrForecastVAR$new()
+task$data()
+task
+
+rr = rsmp("RollingWindowCV", folds = 5, fixed_window = F)
+rr$instantiate(task)
+rr
+resample = resample(task, learner, rr, store_models = TRUE)
+resample$aggregate(msr("classif.ce"))
+resample$predictions()
+```
+
