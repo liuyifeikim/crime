@@ -214,7 +214,9 @@ at <- AutoTuner$new(
   search_space = tune_grid,
   tuner = tnr("random_search"),
   terminator = trm("evals", n_evals = 20),
-  store_tuning_instance = TRUE)
+  store_models = TRUE,
+  store_tuning_instance = TRUE,
+  store_benchmark_result = TRUE)
 
 # 外层重抽样
 plan(list("multisession", "multisession"))
@@ -231,11 +233,39 @@ plan(sequential)
 
 
 ```{r}
-# 查看结果
-rr_at
+# 各个模型内层重抽样结果
+lapply(rr_at$learners, function(x) x$tuning_result)
+
+# 各个模型外层重抽样结果
+rr_at$score(msr("classif.auc"))
+
+# 外层重抽样平均测试性能
+rr_at$aggregate(msr("classif.auc"))
 ```
 
+```{r}
+# 训练最终模型：找到最优参数后，会将全部训练数据训练一次
+plan(multisession)
+set.seed(100)
+tic()
+at$train(task_train_sample)
+toc()
+plan(sequential)
+```
 
+```{r}
+# 模型信息
+at$learner                                # 最优流程
+at$archive$best()                         # 最优流程
+at$archive$data %>% arrange(-classif.auc) # 全部调试结果
+```
+
+```{r}
+# 预测测试集
+task_test_sample_predict <- at$predict(task = task_test_sample)
+task_test_sample_predict
+task_test_sample_predict$score(msr("classif.auc"))
+```
 
 
 
